@@ -1,0 +1,12 @@
+.DS_Store
+.swp
+__pycache__/
+*.pyc
+*.pth
+annotations/
+annotations.zip
+coco_annotations/
+data/
+wheelnet_model.pth
+AGENTS.md
+CLAUDE.md

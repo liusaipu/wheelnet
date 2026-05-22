@@ -8,7 +8,7 @@ from pathlib import Path
 from PIL import Image, UnidentifiedImageError
 
 
-CLASSES = ["two_wheel", "three_wheel", "four_wheel"]
+CLASSES = ["two_wheel", "three_wheel", "four_wheel", "other"]
 RAW_DIR = Path("data/raw")
 TRAIN_DIR = Path("data/train")
 VAL_DIR = Path("data/val")

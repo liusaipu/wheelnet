@@ -12,8 +12,8 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import models, transforms
 
 
-CLASSES = ["two_wheel", "three_wheel", "four_wheel"]
-CLASS_NAMES = ["二轮车", "三轮车", "四轮车"]
+CLASSES = ["two_wheel", "three_wheel", "four_wheel", "other"]
+CLASS_NAMES = ["二轮车", "三轮车", "四轮车", "其他"]
 DATA_DIR = Path("data")
 MODEL_PATH = Path("wheelnet_model.pth")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -78,12 +78,15 @@ class VehicleDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, index):
-        path, label = self.samples[index]
-        try:
-            image = Image.open(path).convert("RGB")
-        except (OSError, UnidentifiedImageError):
-            return self.__getitem__((index + 1) % len(self.samples))
-        return self.transform(image), label
+        n = len(self.samples)
+        for offset in range(n):
+            path, label = self.samples[(index + offset) % n]
+            try:
+                image = Image.open(path).convert("RGB")
+            except (OSError, UnidentifiedImageError):
+                continue
+            return self.transform(image), label
+        raise RuntimeError("所有样本都无法读取")
 
 
 def collate_skip_bad(batch):
@@ -96,8 +99,8 @@ def collate_skip_bad(batch):
 
 def evaluate(model, loader):
     model.eval()
-    total = 0
-    correct = 0
+    n_classes = len(CLASSES)
+    cm = torch.zeros(n_classes, n_classes, dtype=torch.long)
     with torch.no_grad():
         for batch in loader:
             if batch is None:
@@ -107,9 +110,12 @@ def evaluate(model, loader):
             labels = labels.to(DEVICE)
             outputs = model(images)
             preds = outputs.argmax(dim=1)
-            total += labels.size(0)
-            correct += (preds == labels).sum().item()
-    return correct / total if total else 0.0
+            for t, p in zip(labels.cpu().tolist(), preds.cpu().tolist()):
+                cm[t, p] += 1
+    total = cm.sum().item()
+    correct = cm.diag().sum().item()
+    acc = correct / total if total else 0.0
+    return acc, cm
 
 
 def main():
@@ -127,6 +133,12 @@ def main():
     counts = [0] * len(CLASSES)
     for _, label in train_ds.samples:
         counts[label] += 1
+    missing = [CLASS_NAMES[i] for i, c in enumerate(counts) if c == 0]
+    if missing:
+        raise SystemExit(
+            f"以下类别在 data/train 下没有图片：{missing}，"
+            "请先把图片放到 data/raw/<class>/ 并重新运行 split_manual_data.py"
+        )
     weights = torch.tensor([1.0 / max(c, 1) for c in counts], dtype=torch.float32, device=DEVICE)
     weights = weights / weights.sum() * len(CLASSES)
 
@@ -150,6 +162,7 @@ def main():
     optimizer = torch.optim.Adam(model.classifier.parameters(), lr=LR)
 
     best_acc = 0.0
+    best_cm = None
     for epoch in range(1, EPOCHS + 1):
         model.train()
         running_loss = 0.0
@@ -172,15 +185,38 @@ def main():
             seen += labels.size(0)
 
         train_loss = running_loss / seen if seen else 0.0
-        val_acc = evaluate(model, val_loader)
-        print(f"epoch {epoch}/{EPOCHS} train_loss={train_loss:.4f} val_acc={val_acc:.4f}")
+        val_acc, val_cm = evaluate(model, val_loader)
+        per_class = []
+        for i, name in enumerate(CLASS_NAMES):
+            total_i = val_cm[i].sum().item()
+            acc_i = val_cm[i, i].item() / total_i if total_i else 0.0
+            per_class.append(f"{name}={acc_i:.2f}")
+        print(
+            f"epoch {epoch}/{EPOCHS} train_loss={train_loss:.4f} "
+            f"val_acc={val_acc:.4f} [{' '.join(per_class)}]"
+        )
 
         if val_acc >= best_acc:
             best_acc = val_acc
-            torch.save(model.state_dict(), MODEL_PATH)
+            best_cm = val_cm
+            torch.save(
+                {
+                    "state_dict": model.state_dict(),
+                    "classes": CLASSES,
+                    "display_classes": CLASS_NAMES,
+                },
+                MODEL_PATH,
+            )
 
     print(f"best_val_acc={best_acc:.4f}")
     print(f"saved: {MODEL_PATH}")
+
+    if best_cm is not None:
+        print("\n混淆矩阵（行=真实, 列=预测）:")
+        print("           " + "  ".join(f"{n}" for n in CLASS_NAMES))
+        for i, name in enumerate(CLASS_NAMES):
+            row = "  ".join(f"{best_cm[i, j].item():4d}" for j in range(len(CLASSES)))
+            print(f"  {name}     {row}")
 
 
 if __name__ == "__main__":

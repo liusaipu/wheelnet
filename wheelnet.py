@@ -18,7 +18,7 @@ from torchvision import models, transforms
 from PIL import Image
 
 # ── 配置 ──────────────────────────────────────────────
-CLASSES = ["二轮车", "三轮车", "四轮车"]
+DISPLAY_CLASSES = ["二轮车", "三轮车", "四轮车", "其他"]
 MODEL_PATH = Path("wheelnet_model.pth")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -26,11 +26,11 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ── 模型定义 ──────────────────────────────────────────
 
 def create_model(pretrained=False):
-    """创建 MobileNetV2 + 3 类分类头"""
+    """创建 MobileNetV2 + 分类头（输出维度跟随 DISPLAY_CLASSES）"""
     weights = models.MobileNet_V2_Weights.DEFAULT if pretrained else None
     model = models.mobilenet_v2(weights=weights)
     in_features = model.classifier[1].in_features
-    model.classifier[1] = nn.Linear(in_features, 3)
+    model.classifier[1] = nn.Linear(in_features, len(DISPLAY_CLASSES))
     return model
 
 
@@ -63,7 +63,7 @@ def predict(model, image_tensor):
         outputs = model(image_tensor)
         probs = torch.softmax(outputs, dim=1)
         conf, pred = torch.max(probs, 1)
-    return CLASSES[pred.item()], conf.item()
+    return DISPLAY_CLASSES[pred.item()], conf.item()
 
 
 def load_model(require_trained=False):
@@ -71,7 +71,16 @@ def load_model(require_trained=False):
     if MODEL_PATH.exists():
         print(f"[加载] 已有模型 {MODEL_PATH}")
         model = create_model(pretrained=False)
-        state_dict = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=True)
+        checkpoint = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=True)
+        if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+            saved = checkpoint.get("display_classes")
+            if saved and list(saved) != DISPLAY_CLASSES:
+                raise SystemExit(
+                    f"模型类别不一致：checkpoint={list(saved)}，当前={DISPLAY_CLASSES}"
+                )
+            state_dict = checkpoint["state_dict"]
+        else:
+            state_dict = checkpoint
         model.load_state_dict(state_dict)
         return model.to(DEVICE).eval()
 
@@ -135,19 +144,20 @@ def run_demo(model):
     print("wheelnet 演示"
           "\n基于 MobileNetV2 的车辆轮数分类")
     print("=" * 50)
+    print("\n说明：演示输入为合成色块，仅用于验证推理流程；预测结果不代表真实准确率。")
+    print("      要看真实识别，请用 python3 wheelnet.py /path/to/image.jpg")
 
     types = ["two_wheel", "three_wheel", "four_wheel"]
     names = ["二轮车", "三轮车", "四轮车"]
 
-    print(f"\n{'图片类别':<10} {'预测结果':<10} {'置信度':<10}")
+    print(f"\n{'合成图样':<10} {'预测结果':<10} {'置信度':<10}")
     print("-" * 35)
 
     for t, name in zip(types, names):
         img = _make_demo_image(t)
         tensor = transform(img).unsqueeze(0)
         pred, conf = predict(model, tensor)
-        correct = "✓" if pred == name else "✗"
-        print(f"{name:<10} {pred:<10} {conf:.2%}     {correct}")
+        print(f"{name + '形状':<10} {pred:<10} {conf:.2%}")
 
     print(f"\n设备: {DEVICE}")
     print(f"模型: MobileNetV2 (参数量: ~3.5M)")

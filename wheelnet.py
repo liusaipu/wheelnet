@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 wheelnet.py — 基于 MobileNetV2 的二/三/四轮车辆分类
 竞赛演示版（内置 3 类测试图片生成器）
@@ -10,6 +11,8 @@ wheelnet.py — 基于 MobileNetV2 的二/三/四轮车辆分类
 """
 
 import argparse
+import json
+from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -18,7 +21,10 @@ from torchvision import models, transforms
 from PIL import Image
 
 # ── 配置 ──────────────────────────────────────────────
+CLASS_CODES = ["two_wheel", "three_wheel", "four_wheel", "other"]
 DISPLAY_CLASSES = ["二轮车", "三轮车", "四轮车", "其他"]
+DISPLAY_TO_CODE = dict(zip(DISPLAY_CLASSES, CLASS_CODES))
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 MODEL_PATH = Path("wheelnet_model.pth")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -51,8 +57,10 @@ transform = transforms.Compose([
 
 def load_image(image_path):
     """加载单张图片并预处理"""
-    img = Image.open(image_path).convert("RGB")
-    return transform(img).unsqueeze(0)  # 加 batch 维度
+    with Image.open(image_path) as img:
+        if img.mode == "P" and "transparency" in img.info:
+            img = img.convert("RGBA")
+        return transform(img.convert("RGB")).unsqueeze(0)  # 加 batch 维度
 
 
 def predict(model, image_tensor):
@@ -64,6 +72,91 @@ def predict(model, image_tensor):
         probs = torch.softmax(outputs, dim=1)
         conf, pred = torch.max(probs, 1)
     return DISPLAY_CLASSES[pred.item()], conf.item()
+
+
+def is_image_file(path):
+    """判断路径是否为支持的图片文件。"""
+    return path.suffix.lower() in IMAGE_SUFFIXES
+
+
+def iter_image_paths(input_path, recursive=False):
+    """返回单个图片或目录中的图片列表。"""
+    path = Path(input_path).expanduser()
+    if path.is_file():
+        if not is_image_file(path):
+            raise SystemExit(f"不是支持的图片文件: {path}")
+        return [path]
+
+    if not path.is_dir():
+        raise SystemExit(f"图片或目录不存在: {path}")
+
+    if recursive:
+        images = [p for p in path.rglob("*") if p.is_file() and is_image_file(p)]
+    else:
+        images = [p for p in path.iterdir() if p.is_file() and is_image_file(p)]
+
+    images = sorted(images)
+    if not images:
+        raise SystemExit(f"目录中没有支持的图片文件: {path}")
+    return images
+
+
+def read_image_metadata(image_path):
+    """读取图片尺寸信息。"""
+    with Image.open(image_path) as img:
+        return {
+            "width": img.width,
+            "height": img.height,
+            "depth": len(img.getbands()),
+        }
+
+
+def predict_image(model, image_path):
+    """识别单张图片，返回可写入 JSON 的结构化结果。"""
+    path = Path(image_path).expanduser()
+    resolved = path.resolve()
+    metadata = read_image_metadata(path)
+    tensor = load_image(path)
+    pred, conf = predict(model, tensor)
+
+    return {
+        "path": str(resolved),
+        "filename": resolved.name,
+        "folder": str(resolved.parent),
+        **metadata,
+        "class_code": DISPLAY_TO_CODE[pred],
+        "class_name": pred,
+        "confidence": round(conf, 6),
+        "bbox": None,
+    }
+
+
+def build_json_report(input_path, recursive, results):
+    """生成批量识别 JSON 报告。"""
+    resolved_input = Path(input_path).expanduser().resolve()
+    return {
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "input": str(resolved_input),
+        "recursive": recursive,
+        "model_path": str(MODEL_PATH.resolve()) if MODEL_PATH.exists() else None,
+        "device": str(DEVICE),
+        "classes": [
+            {"code": code, "name": name}
+            for code, name in zip(CLASS_CODES, DISPLAY_CLASSES)
+        ],
+        "total": len(results),
+        "results": results,
+    }
+
+
+def write_json_report(report, output_path):
+    """把识别报告写入 JSON 文件。"""
+    path = Path(output_path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    return path
 
 
 def load_model(require_trained=False):
@@ -163,36 +256,114 @@ def run_demo(model):
     print(f"模型: MobileNetV2 (参数量: ~3.5M)")
 
 
-def run_image_cli(image_path):
-    """识别单张图片并输出中文结果。"""
-    path = Path(image_path).expanduser()
-    if not path.is_file():
-        raise SystemExit(f"图片不存在或不是文件: {path}")
-
-    model = load_model(require_trained=True)
-    tensor = load_image(path)
-    pred, conf = predict(model, tensor)
-
+def print_single_result(result):
+    """按原来的格式输出单张识别结果。"""
     print("\n" + "=" * 50)
     print("wheelnet 单图识别")
     print("=" * 50)
-    print(f"图片: {path}")
-    print(f"识别结果: {pred}")
-    print(f"置信度: {conf:.2%}")
+    print(f"图片: {result['path']}")
+    print(f"识别结果: {result['class_name']}")
+    print(f"置信度: {result['confidence']:.2%}")
+    print(f"尺寸: {result['width']}x{result['height']}x{result['depth']}")
     print(f"设备: {DEVICE}")
+
+
+def print_batch_start(total):
+    """输出批量识别开始信息。"""
+    print("\n" + "=" * 50)
+    print("wheelnet 批量识别")
+    print("=" * 50)
+    print(f"图片数量: {total}")
+    print(f"设备: {DEVICE}")
+    print("-" * 50)
+
+
+def print_progress_current(index, total, image_path):
+    """输出当前正在识别的图片。"""
+    path = Path(image_path).expanduser().resolve()
+    print(f"[{index}/{total}] 正在识别: {path}", flush=True)
+
+
+def print_progress_result(index, total, result):
+    """输出当前图片识别结果和完成进度。"""
+    percent = index / total * 100
+    print(
+        f"[{index}/{total} {percent:6.2f}%] "
+        f"识别结果: {result['class_name']} "
+        f"置信度: {result['confidence']:.2%}",
+        flush=True,
+    )
+
+
+def print_batch_done(results):
+    """输出批量识别结束信息。"""
+    print("-" * 50)
+    print(f"识别完成: {len(results)} 张")
+
+
+def run_image_cli(input_path, json_output=None, recursive=False):
+    """识别单张图片或目录；可选写入 JSON 报告。"""
+    image_paths = iter_image_paths(input_path, recursive=recursive)
+    model = load_model(require_trained=True)
+    batch_output = (
+        json_output is not None
+        or len(image_paths) > 1
+        or Path(input_path).expanduser().is_dir()
+    )
+
+    if batch_output:
+        print_batch_start(len(image_paths))
+
+    results = []
+    total = len(image_paths)
+    for index, path in enumerate(image_paths, start=1):
+        if batch_output:
+            print_progress_current(index, total, path)
+        result = predict_image(model, path)
+        results.append(result)
+        if batch_output:
+            print_progress_result(index, total, result)
+
+    if batch_output:
+        print_batch_done(results)
+    else:
+        print_single_result(results[0])
+
+    if json_output:
+        report = build_json_report(input_path, recursive, results)
+        output_path = write_json_report(report, json_output)
+        print(f"\nJSON结果: {output_path}")
 
 
 # ── 主入口 ────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="wheelnet 车辆轮数分类")
-    parser.add_argument("image", nargs="?", help="要识别的图片路径")
-    parser.add_argument("-i", "--image", "--image-path", dest="image_path", help="要识别的图片路径")
+    parser.add_argument("image", nargs="?", help="要识别的图片或目录路径")
+    parser.add_argument(
+        "-i",
+        "--image",
+        "--image-path",
+        "--input",
+        dest="image_path",
+        help="要识别的图片或目录路径",
+    )
+    parser.add_argument(
+        "-o",
+        "--json-output",
+        help="把识别结果写入指定 JSON 文件",
+    )
+    parser.add_argument(
+        "-r",
+        "--recursive",
+        action="store_true",
+        help="输入为目录时递归扫描子目录",
+    )
     args = parser.parse_args()
 
     image_path = args.image_path or args.image
     if image_path:
-        run_image_cli(image_path)
+        run_image_cli(image_path, json_output=args.json_output, recursive=args.recursive)
         return
 
     model = train_demo()
